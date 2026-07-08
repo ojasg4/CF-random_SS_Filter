@@ -1,0 +1,6 @@
+failed_Ecoli.sh
+fold_switch_dssp_*
+logs/
+src/old_pipeline*
+src/utils/__pycache*
+src/utils/recovery_utils/__pycache*

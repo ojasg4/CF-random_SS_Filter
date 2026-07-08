@@ -1,0 +1,85 @@
+{
+  "thresholds": {
+    "min_consecutive_changed_residues": 4,
+    "min_region_separation_to_keep_separate": 6,
+    "max_total_change_regions": 2,
+    "rmsd_threshold": 0.5
+  },
+
+  "dssp_codes": {
+    "helix":      ["H", "G", "I"],
+    "beta":       ["E", "B"],
+    "kappa":      ["P"],
+    "disordered": ["T", "S", "-", "", " ", "C"]
+  },
+
+  "groups": {
+    "helix":      "HELIX",
+    "beta":       "BETA",
+    "kappa":      "KAPPA",
+    "disordered": "DISORDERED"
+  },
+
+  "group_single_letter": {
+    "HELIX":      "H",
+    "BETA":       "B",
+    "KAPPA":      "P",
+    "DISORDERED": "C"
+  },
+
+  "summary_files": {
+    "likely":   "likely_predictions.csv",
+    "unlikely": "unlikely_predictions.csv"
+  },
+
+  "csv_columns": {
+    "base_prefix": [
+      "input_pse",
+      "alternative_model",
+      "classification",
+      "rmsd_to_dominant",
+      "rmsd_threshold",
+      "n_switch_residues",
+      "n_switch_regions",
+      "n_disordered_change_residues",
+      "n_disordered_change_regions",
+      "invalid_reason"
+    ],
+    "base_suffix": [
+      "run_mode",
+      "sequences_identical",
+      "selected_colored_pse",
+      "raw_dssp_dir",
+      "saved_folds_dir"
+    ],
+    "keep_going": [
+      "keep_going_n_likely_hit_structures",
+      "keep_going_likely_hit_pdb_files"
+    ],
+    "phenix_mode_columns": [
+      "n_phenix_skipped",
+      "dominant_phenix_predictive",
+      "dominant_phenix_unpacked_high_plddt",
+      "dominant_phenix_unpacked_possible",
+      "dominant_phenix_near_predictive",
+      "dominant_phenix_pseudostructure",
+      "dominant_phenix_barbed_wire",
+      "dominant_phenix_unphysical",
+      "dominant_phenix_unassigned",
+      "alternative_phenix_predictive",
+      "alternative_phenix_unpacked_high_plddt",
+      "alternative_phenix_unpacked_possible",
+      "alternative_phenix_near_predictive",
+      "alternative_phenix_pseudostructure",
+      "alternative_phenix_barbed_wire",
+      "alternative_phenix_unphysical",
+      "alternative_phenix_unassigned"
+    ],
+    "recovery_metrics": [
+      "same_ss_preserved",
+      "same_ss_recovery_region_count",
+      "same_ss_recovery_regions",
+      "same_ss_recovery_max_avg_distance"
+    ]
+  }
+}
