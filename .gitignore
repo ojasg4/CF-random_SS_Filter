@@ -4,3 +4,8 @@ logs/
 src/old_pipeline*
 src/utils/__pycache*
 src/utils/recovery_utils/__pycache*
+ez_outputs.py
+visualization_output.xlsx
+combined_data_distributions_full.xlsx
+combined_Ecoli.sh
+

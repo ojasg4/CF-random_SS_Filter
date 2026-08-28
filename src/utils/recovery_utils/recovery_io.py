@@ -41,13 +41,10 @@ def parse_dssp_with_bridges(dssp_path: Path) -> List[ResidueSS]:
 
 def load_residues(model: ExtractedModel) -> List[ResidueSS]:
     if not model.dssp_path.exists() or model.dssp_path.stat().st_size == 0:
-        model.dssp_path.parent.mkdir(parents=True, exist_ok=True)
-        for binary, extra in [("dssp", False), ("mkdssp", True)]:
-            cmd = ([binary, "-i", str(model.pdb_path), "-o", str(model.dssp_path)]
-                   if extra else [binary, str(model.pdb_path), str(model.dssp_path)])
-            result = subprocess.run(cmd, capture_output=True)
-            if result.returncode == 0:
-                break
+        raise ValueError(
+            f"Missing cached DSSP for {model.model_name} at {model.dssp_path}. "
+            f"Run the main pipeline with --keep-work first."
+        )
     return parse_dssp_with_bridges(model.dssp_path)
 
 
@@ -76,7 +73,7 @@ def write_recovery_log(
         fh.write(f"# dominant={dominant_name}\n")
         fh.write(f"# selected={selected.alternative_model if selected else 'none'}\n")
         fh.write(f"# selected_detector={selected.detector_hit if selected else 'none'}\n")
-        fh.write(f"# bridge_reshuffle_enabled={args.bridge_reshuffling}\n")
+        fh.write(f"# bridge_reshuffle_enabled={args.beta_bridges}\n")
         fh.write(f"# min_run_length={args.min_run_length}\n")
         ordered = list(assignments.keys())
         if not ordered:
@@ -115,7 +112,7 @@ OUTPUT_COLUMNS = [
     "disorder_change_regions", "disorder_change_residue_count",
     "rigid_body_regions", "rigid_body_max_window_distance",
     "sequences_identical", "n_candidates_analyzed",
-    "log_file", "raw_dssp_dir", "invalid_reason",
+    "log_file", "raw_dssp_dir", "invalid_reason", "dom_chainsaw", "alt_chainsaw"
 ]
 
 def result_to_row(
@@ -127,6 +124,7 @@ def result_to_row(
     raw_dssp_dir: Path,
     base_dir: Path,
     invalid_reason: str = "",
+    chainsaw_fields: Optional[Dict] = None
 ) -> Dict[str, object]:
     base = {
         "input_pse":             relative_path_for_summary(input_pse, base_dir),
@@ -170,6 +168,8 @@ def result_to_row(
         base["rigid_body_max_window_distance"] = (
             f"{result.rigid_body_max_window_distance:.3f}"
         )
+    if chainsaw_fields:
+        base.update(chainsaw_fields)
     return base
 
 

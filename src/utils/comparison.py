@@ -6,7 +6,7 @@ from utils.config import (
     DISORDERED_DSSP_CODES,
     GROUP_DISORDERED,
 )
-from utils.classes import ComparedSegment, ModelComparison, Residue, OpenSegment
+from utils.classes import ComparedSegment, ModelComparison, Residue, OpenSegment, ExtractedModel
 from utils.dssp import (
     classify_foldswitch,
     get_sequence,
@@ -14,7 +14,91 @@ from utils.dssp import (
     normalize_dssp_code,
 )
 from utils.utils import compact_reason
+from utils.outputs import log_input_too_disordered
+from pathlib import Path
 
+TOO_DISORDERED_THRESHOLD_PERCENT = 55.0
+
+def input_is_too_disordered(
+    jobname: str,
+    summarydir: Path,
+    dominant_dssp_code: Sequence,
+) -> bool:
+    from utils.dssp import percent_unassigned
+    pct = percent_unassigned(dominant_dssp_code) # checks only for - or space
+    if pct > TOO_DISORDERED_THRESHOLD_PERCENT:
+        log_input_too_disordered(jobname, summarydir, pct)
+        return True
+    return False
+
+def is_good_physical_prediction(
+    candidate_model: ExtractedModel,
+    dominant_residues: Sequence,
+    verbose: bool = False,
+) -> bool:
+    """
+    Returns True if the candidate model passes all physical prediction filters.
+    Filters are applied in order and are cumulative — all must pass.
+
+    Step 1a: Phenix filter for good residues. Predictive must be >= 15% OR Unpacked high pLDDT >= 30%
+    Step 1b: Unphysical must be <= 5%.
+    Step 2: Unassigned DSSP filter — alternative unassigned percent must not exceed
+            dominant by more than UNASSIGNED_MAX_ALTERNATIVE_PERCENT.
+    """
+    from utils.phenix_filter import get_mode_fractions
+    from utils.dssp import run_dssp, percent_unassigned
+    from utils.config import UNASSIGNED_MAX_ALTERNATIVE_PERCENT
+
+    # Step 1: Phenix filter
+    fractions = get_mode_fractions(
+        candidate_model.pdb_path, 
+        candidate_model.dssp_path.with_suffix(".phenix"),
+    )
+
+    if fractions is None:
+        return True #Phenix failed but keep going
+
+    if fractions is not None:
+        predictive_pct = fractions.get("Predictive") * 100.0
+        unpacked_highPLDDt_pct = fractions.get("Unpacked high pLDDT") * 100.0
+        unphysical_pct = fractions.get("Unphysical") * 100.0
+
+        if predictive_pct < 15.0 and unpacked_highPLDDt_pct < 30.0:
+            if verbose:
+                print(
+                    f"  {candidate_model.model_name}: rejected, not enough good residues"
+                    f"(Predictive={predictive_pct:.1f}% < 15% and Unpacked high pLDDT={unpacked_highPLDDt_pct:.1f}% < 30%).\n"
+                )
+            return False
+
+        if unphysical_pct > 5.0:
+            if verbose:
+                print(
+                    f"  {candidate_model.model_name}: rejected, too many bad residues"
+                    f"(Unphysical={unphysical_pct:.1f}% > 5%)."
+                )
+            return False
+
+    # Step 2: Unassigned DSSP filter (only reached if phenix passed)
+    try:
+        alt_residues = run_dssp(candidate_model)
+        dom_pct = percent_unassigned(dominant_residues)
+        alt_pct = percent_unassigned(alt_residues)
+        if alt_pct > dom_pct + UNASSIGNED_MAX_ALTERNATIVE_PERCENT:
+            if verbose:
+                print(
+                    f"  {candidate_model.model_name}: rejected "
+                    f"(alt_unassigned={alt_pct:.1f}% > dom={dom_pct:.1f}% "
+                    f"+ {UNASSIGNED_MAX_ALTERNATIVE_PERCENT:.1f}%)."
+                )
+            return False
+    except Exception:
+        if verbose:
+            print(f"  {candidate_model.model_name}: DSSP failed, skipping unassigned filter.")
+
+    return True
+
+    
 # Helper of helper, processes raw DSSP into list with structures (Beta, Helix, Kappa, Disordered) and bridges short disordered gaps
 def _build_strand_groups(
     residues: Sequence[Residue],
@@ -142,7 +226,7 @@ def compare_dssp_codes(
     return switch_segments, disordered_change_segments, same_ss_preserved_percent
 
 
-# Main function called at pdb/pse file level called by structure.py helper file
+# Main function called at pdb/pse file level called by pdb_helpers.py helper file
 def compare_candidate_models(
     dominant_model,
     alternative_models: Sequence,
@@ -159,7 +243,7 @@ def compare_candidate_models(
     from utils.phenix_filter import get_mode_fractions
     from utils.phenix_filter import PHENIX_FILTERED_MODES
     for encounter_index, model in enumerate(alternative_models):
-        fractions = get_mode_fractions(model.pdb_path)
+        fractions = get_mode_fractions(model.pdb_path, model.dssp_path.with_suffix(".phenix"),)
         rmsd, rmsd_error = rmsd_results.get(
             model.model_name, (None, "missing_rmsd_result")
         )
@@ -169,8 +253,8 @@ def compare_candidate_models(
             rmsd_to_dominant=rmsd,
             switch_segments=[],
             disordered_change_segments=[],
-            # Recalculate phenix filter (already calculated in pipelines.py)
-            # to store it in Comparison for eventual display per alternative model
+            # Phenix filter is cached (already calculated in pipelines.py)
+            # needs to be stored in Comparison for eventual display per alternative model
             barbed_wire_fraction=sum(fractions.get(mode, 0.0) for mode in PHENIX_FILTERED_MODES),
         )
         if rmsd_error or rmsd is None:

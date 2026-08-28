@@ -4,19 +4,105 @@ Entry point for the fold-switch DSSP screen.
 
 Usage:
     python src/main.py <pse_file> --job-name <name> [options]
+    python src/main.py <dir_or_pse> ... [--processes N] [options]
 
 Run with --help for the full option list.
 """
 
 import argparse
 import os
+import re
 import sys
 import tempfile
+import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from multiprocessing import Pool
+from functools import partial
+
 from utils.config import MIN_CONSECUTIVE_CHANGED_RESIDUES, RMSD_THRESHOLD
 from utils.pipelines import run_pipeline_default, run_pipeline_keep_going
+from utils.cli_helpers import derive_job_name, collect_pse_files
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+def _init_worker():
+    from utils.chainsaw_filter import _load_chainsaw_model
+    _load_chainsaw_model()
+
+def run_for_one(args, job_name: str) -> None:
+    """
+    Runs the pipeline for a single protein with work-dir handling.
+
+    Important:
+      - If --keep-work is set, work_dir stays:
+            <work_root>/<job_name>/
+      - If --keep-work is not set, work_dir is temporary and deleted after the job.
+        That means any DSSP/Phenix caches written into work_dir are also deleted.
+
+    Quiet-mode stdout/stderr are written to:
+        <logs_root>/<job_name>/pipeline.log
+    """
+    protein_log_dir = args.logs_root / job_name
+    protein_log_dir.mkdir(parents=True, exist_ok=True)
+
+    pipeline_log_path = protein_log_dir / "pipeline.log"
+
+    pipeline = run_pipeline_keep_going if args.keep_going else run_pipeline_default
+
+    temp_dir = None
+    if args.keep_work:
+        work_dir = args.work_root / job_name
+        work_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        temp_dir = tempfile.TemporaryDirectory(prefix=f"{job_name}_dssp_work_")
+        work_dir = Path(temp_dir.name)
+
+    try:
+        if args.verbose:
+            print(f"[{job_name}] work_dir={work_dir}")
+            if not args.keep_work:
+                print(
+                    f"[{job_name}] WARNING: --keep-work is not set; "
+                    "loaded pdbs/DSSP/Phenix caches in work_dir will be deleted after this job."
+                )
+            pipeline(args, job_name, protein_log_dir, work_dir)
+        else:
+            with pipeline_log_path.open("w") as log_handle:
+                with redirect_stdout(log_handle), redirect_stderr(log_handle):
+                    print(f"[{job_name}] work_dir={work_dir}")
+                    if not args.keep_work:
+                        print(
+                            f"[{job_name}] WARNING: --keep-work is not set; "
+                            "loaded pdbs/DSSP/Phenix caches in work_dir will be deleted after this job."
+                        )
+                    pipeline(args, job_name, protein_log_dir, work_dir)
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def process_one_protein(pse_file: Path, args_dict: dict) -> tuple:
+    """
+    extra handler/wrapper of run_for_one when more than pse is found in file directory.
+    """
+    args = argparse.Namespace(**args_dict)
+    args.pse_file = pse_file
+
+    job_name = derive_job_name(pse_file)
+    protein_log_dir = args.logs_root / job_name
+    protein_log_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_log_path = protein_log_dir / "pipeline.log"
+
+    try:
+        run_for_one(args, job_name)
+        return (job_name, True, "")
+    except Exception as exc:
+        with pipeline_log_path.open("a") as log_handle:
+            log_handle.write("\n\nERROR TRACEBACK\n")
+            log_handle.write(traceback.format_exc())
+            log_handle.write("\n")
+        return (job_name, False, str(exc))
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,14 +110,26 @@ def parse_args() -> argparse.Namespace:
         description="Extract structures from a PSE, skip alternatives below the minimum RMSD to Dominant, compare DSSP secondary structure, and write likely/unlikely summaries."
     )
     parser.add_argument(
-        "pse_file",
+        "inputs",
         type=Path,
-        help="Input .pse file containing the exact case-sensitive Dominant structure.",
+        nargs="+",
+        help="One or more .pse files, or directories to search recursively for PSE files (see --pse-glob).",
     )
     parser.add_argument(
         "--job-name",
-        required=True,
-        help="Name used for per-run output files and the per-run log subdirectory.",
+        default=None,
+        help="Name used for per-run output files and the per-run log subdirectory. Only valid with a single PSE file; otherwise job names are derived from each path.",
+    )
+    parser.add_argument(
+        "--processes",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes when multiple PSE files are found.",
+    )
+    parser.add_argument(
+        "--pse-glob",
+        default="*structures_of_interest.pse",
+        help="Glob pattern used to find PSE files inside input directories (recursive).",
     )
     parser.add_argument(
         "--logs-root",
@@ -101,50 +199,96 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to config.json (defaults to config/config.json from the repo root).",
     )
+    parser.add_argument(
+        "--chainsaw",
+        action="store_true",
+        help="Run Chainsaw domain analysis on the work directory after selection. "
+             "Default mode only; requires --keep-work.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    print("DEBUG: script started", flush=True)
+    print(f"DEBUG: inputs={args.inputs}", flush=True)
+    print(f"DEBUG: pse_glob={args.pse_glob}", flush=True)
+
     try:
         if args.min_run_length < 1:
             raise ValueError("--min-run-length must be >= 1")
+
         if args.rmsd_threshold < 0:
             raise ValueError("--rmsd-threshold must be >= 0")
 
-        job_name = args.job_name
-        protein_log_dir = args.logs_root / job_name
-        protein_log_dir.mkdir(parents=True, exist_ok=True)
+        if args.processes < 1:
+            raise ValueError("--processes must be >= 1")
 
-        pipeline = run_pipeline_keep_going if args.keep_going else run_pipeline_default
+        pse_files = collect_pse_files(args.inputs, args.pse_glob)
+        if not pse_files:
+            raise ValueError(
+                f"No PSE files found. Searched inputs {args.inputs} "
+                f"for pattern '{args.pse_glob}'."
+            )
 
-        temp_dir = None
-        if args.keep_work:
-            work_dir = args.work_root / job_name
-            work_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            temp_dir = tempfile.TemporaryDirectory(prefix=f"{job_name}_dssp_work_")
-            work_dir = Path(temp_dir.name)
+        if len(pse_files) > 1 and args.job_name:
+            raise ValueError(
+                "--job-name cannot be used with multiple PSE files; "
+                "job names are derived per file."
+            )
 
-        # Try and finally block ensures the temp_dir is cleaned even if code fails
-        try:
-            if args.verbose:
-                pipeline(args, job_name, protein_log_dir, work_dir)
-            else:
-                with open(os.devnull, "w") as devnull:
-                    with redirect_stdout(devnull), redirect_stderr(devnull):
-                        pipeline(args, job_name, protein_log_dir, work_dir)
-        finally:
-            if temp_dir is not None:
-                temp_dir.cleanup() # Method of TemporaryDirectory
-        return 0
+        if not args.keep_work:
+            print(
+                "WARNING: --keep-work is not set. DSSP/Phenix caches written "
+                "under work_dir will be temporary and will not be available "
+                "for later visualization.",
+                file=sys.stderr,
+            )
+
+        # Single file, single process: run directly.
+        if len(pse_files) == 1 and args.processes == 1:
+            args.pse_file = pse_files[0]
+            job_name = args.job_name if args.job_name else derive_job_name(pse_files[0])
+            run_for_one(args, job_name)
+            return 0
+
+        # Multiple files or parallel processing.
+        args_dict = {
+            key: value
+            for key, value in vars(args).items()
+            if key not in {"inputs", "pse_file"}
+        }
+
+        worker = partial(process_one_protein, args_dict=args_dict)
+
+        results = []
+        initializer = _init_worker if args.chainsaw else None
+        
+        with Pool(processes=args.processes) as pool:
+            for job_name, success, error in pool.imap_unordered(worker, pse_files):
+                if success:
+                    print(f"[{job_name}] round 1 completed")
+                else:
+                    print(
+                        f"[{job_name}] FAILED: {error} "
+                        f"(see {args.logs_root / job_name / 'pipeline.log'})"
+                    )
+
+                results.append((job_name, success, error))
+
+        n_ok = sum(1 for _, success, _ in results if success)
+        print(f"\nCompleted: {n_ok}/{len(results)} succeeded")
+
+        return 0 if n_ok == len(results) else 1
 
     except Exception as exc:
         if args.verbose:
             print(f"ERROR: {exc}", file=sys.stderr)
             raise
+
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

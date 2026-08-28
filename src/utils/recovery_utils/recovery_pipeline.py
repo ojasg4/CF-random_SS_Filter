@@ -4,13 +4,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from utils.classes import ExtractedModel
 from utils.dssp import normalize_dssp_code
-from utils.structure import (
-    extract_models_from_pse,
+from utils.pdb_helpers import (
     find_dominant_model,
-    find_keep_going_pdb_files,
-    extracted_models_from_keep_going_pdb_files,
     pymol_session,
 )
+
+from utils.chainsaw_filter import parse_chainsaw_tsv
+
 from .recovery_classes import RecoveryResult, ResidueSS
 from .recovery_logic import (
     detect_bridge_reshuffle,
@@ -22,6 +22,14 @@ from .recovery_logic import (
     DETECTOR_DISORDER_HELIX,
     DETECTOR_RIGID_BODY,
 )
+from utils.chainsaw_filter import (
+    score_work_directory,
+    passes_chainsaw_filter,
+    chainsaw_summary_fields,
+)
+from utils.config import CFG
+HELIX_DSSP_CODES      = set(CFG["dssp_codes"]["helix"])
+BETA_DSSP_CODES       = set(CFG["dssp_codes"]["beta"])
 from .recovery_io import write_recovery_log, result_to_row, load_residues, dssp_string, sequence_from_residues
 
 
@@ -96,20 +104,21 @@ def _analyze_candidate(
         )
 
     dom_dssp, alt_dssp = dssp_string(dom), dssp_string(alt)
-
-    # DETECTOR 1: Beta bridge-partner reshuffle (toggleable)
-    if args.bridge_reshuffling:
-        regions = detect_bridge_reshuffle(dom, alt)
-        if regions:
+    if args.strict: # if a case has the same exact ordered residue counts within 1, ignore
+        print("Make sure to enable the final filter in recovery logic.py as well!")
+        alt_helix_n  = sum(1 for r in alt_dssp if r in HELIX_DSSP_CODES)
+        dom_helix_n  = sum(1 for r in dom_dssp if r in HELIX_DSSP_CODES)
+        alt_strand_n = sum(1 for r in alt_dssp if r in BETA_DSSP_CODES)
+        dom_strand_n = sum(1 for r in dom_dssp if r in BETA_DSSP_CODES)
+        composition_shift = abs(alt_helix_n - dom_helix_n) + abs(alt_strand_n - dom_strand_n)
+        if composition_shift < 1:
             return RecoveryResult(
                 alternative_model=alternative_model.model_name, source=source,
                 encounter_index=encounter_index, sequences_identical=True,
-                detector_hit=DETECTOR_BRIDGE_RESHUFFLE,
-                bridge_reshuffled_regions=regions,
-                dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
+                detector_hit="", dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
             )
 
-    # DETECTOR 2: Disorder to or from Beta
+    # DETECTOR 1: Disorder to or from Beta
     regions = detect_disorder_to_beta(dom, alt, args.min_run_length)
     if regions:
         return RecoveryResult(
@@ -120,7 +129,7 @@ def _analyze_candidate(
             dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
         )
 
-    # DETECTOR 3: Disorder to or from Helix
+    # DETECTOR 2: Disorder to or from Helix
     regions = detect_disorder_to_helix(dom, alt, args.min_run_length)
     if regions:
         return RecoveryResult(
@@ -131,7 +140,7 @@ def _analyze_candidate(
             dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
         )
 
-    # DETECTOR 4: Rigid-body helix displacement
+    # DETECTOR 3: Rigid-body helix displacement
     if cmd is not None:
         distances = _ca_distances(
             cmd, dominant_model.pdb_path, alternative_model.pdb_path,
@@ -147,13 +156,24 @@ def _analyze_candidate(
                 dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
             )
 
+    # DETECTOR 4: Beta bridge-partner reshuffle (toggleable)
+    if args.beta_bridges:
+        regions = detect_bridge_reshuffle(dom, alt)
+        if regions:
+            return RecoveryResult(
+                alternative_model=alternative_model.model_name, source=source,
+                encounter_index=encounter_index, sequences_identical=True,
+                detector_hit=DETECTOR_BRIDGE_RESHUFFLE,
+                bridge_reshuffled_regions=regions,
+                dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
+            )
+
+
     return RecoveryResult(
         alternative_model=alternative_model.model_name, source=source,
         encounter_index=encounter_index, sequences_identical=True,
         detector_hit="", dominant_dssp=dom_dssp, alternative_dssp=alt_dssp,
     )
-
-
 def run_recovery_pipeline(
     args,
     job_name: str,
@@ -169,44 +189,67 @@ def run_recovery_pipeline(
     n_analyzed = 0
 
     try:
-        # 1. Extract structures from PSE
-        models = extract_models_from_pse(input_pse, work_dir, raw_dssp_dir)
+        # 1. Load all cached structures from the work directory.
+        #    The main pipeline (run with --keep-work) already extracted every
+        #    good-prediction PDB here, alongside its .dssp and .phenix cache.
+        #    Nothing is re-extracted or recomputed.
+        pdbs = sorted(work_dir.glob("*.pdb"))
+        if not pdbs:
+            raise ValueError(
+                f"No cached PDBs in {work_dir}. "
+                f"Run the main pipeline with --keep-work first."
+            )
+        models = [
+            ExtractedModel(
+                model_name=p.stem,
+                pdb_path=p,
+                dssp_path=p.with_suffix(".dssp"),
+            )
+            for p in pdbs
+        ]
+
         dominant_model = find_dominant_model(models, args.dominant_label_patterns)
+
         main_alternatives = [
             m for m in models if m.model_name != dominant_model.model_name
         ]
 
         with pymol_session() as cmd:
-            # 2. Search PSE clusters
+            # Scan every cached structure (PSE-cluster and keep-going alike —
+            # both already live in the work dir).
             for enc_idx, alt in enumerate(main_alternatives):
                 result = _analyze_candidate(
-                    dominant_model, alt, "main_pse", enc_idx,
+                    dominant_model, alt, "work_dir", enc_idx,
                     assignments, args, cmd, enc_idx,
                 )
                 results_by_model[result.alternative_model] = result
                 n_analyzed += 1
                 if result.recovered and selected is None:
                     selected = result
-
-            # 3. If no hit, walk keep-going PDB directories
-            if selected is None:
-                keep_going_models = extracted_models_from_keep_going_pdb_files(
-                    find_keep_going_pdb_files(input_pse),
-                    raw_dssp_dir,
-                    input_pse.resolve().parent,
-                )
-                enc_base = len(main_alternatives)
-                for enc_idx, alt in enumerate(keep_going_models):
-                    result = _analyze_candidate(
-                        dominant_model, alt, "keep_going",
-                        enc_base + enc_idx, assignments, args,
-                        cmd, enc_base + enc_idx,
+            
+            # Chainsaw
+            chainsaw_rows = {}
+            # Chainsaw — read the cached TSV written by the main pipeline
+            if getattr(args, "chainsaw", False):
+                tsv_path = work_dir / "chainsaw_results.tsv"
+                if not tsv_path.exists():
+                    raise ValueError(
+                        f"Missing cached chainsaw_results.tsv at {tsv_path}. "
+                        f"Run the main pipeline with --chainsaw --keep-work first."
                     )
-                    results_by_model[result.alternative_model] = result
-                    n_analyzed += 1
-                    if result.recovered:
-                        selected = result
-                        break
+                chainsaw_rows = parse_chainsaw_tsv(tsv_path)
+
+                if selected is not None:
+                    recovered_hits = sorted(
+                        (r for r in results_by_model.values() if r.recovered),
+                        key=lambda r: r.encounter_index,
+                    )
+                    selected = None
+                    for candidate in recovered_hits:
+                        row = chainsaw_rows.get(candidate.alternative_model)
+                        if passes_chainsaw_filter(row):
+                            selected = candidate
+                            break
 
         # 4. Write log and return row
         write_recovery_log(
@@ -216,9 +259,18 @@ def run_recovery_pipeline(
         )
 
         if selected and selected.recovered:
+            chainsaw_fields = {}
+            if getattr(args, "chainsaw", False):
+                chainsaw_fields.update(
+                    chainsaw_summary_fields("dom", chainsaw_rows.get(dominant_model.model_name))
+                )
+                chainsaw_fields.update(
+                    chainsaw_summary_fields("alt", chainsaw_rows.get(selected.alternative_model))
+                )
             return result_to_row(
                 selected, input_pse, "recovered", n_analyzed,
                 log_file, raw_dssp_dir, summary_base_dir,
+                chainsaw_fields=chainsaw_fields,
             ), True
 
         best_failed = next(
@@ -227,12 +279,23 @@ def run_recovery_pipeline(
             ) if not r.invalid_reason),
             None,
         )
+        chainsaw_fields = {}
+        if getattr(args, "chainsaw", False):
+            chainsaw_fields.update(
+                chainsaw_summary_fields("dom", chainsaw_rows.get(dominant_model.model_name))
+            )
+            if best_failed is not None:
+                chainsaw_fields.update(
+                    chainsaw_summary_fields("alt", chainsaw_rows.get(best_failed.alternative_model))
+                )
         return result_to_row(
             best_failed, input_pse, "failed", n_analyzed,
             log_file, raw_dssp_dir, summary_base_dir,
+            chainsaw_fields=chainsaw_fields,
         ), False
 
     except Exception as exc:
+        raise
         write_recovery_log(
             log_file, job_name, input_pse, "Dominant",
             assignments, results_by_model, None, args, summary_base_dir,

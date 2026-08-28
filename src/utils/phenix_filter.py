@@ -1,4 +1,7 @@
+import shutil
 import subprocess
+import tempfile
+
 from pathlib import Path
 from typing import Dict, Optional, Set
 
@@ -26,8 +29,8 @@ PHENIX_THRESHOLDS: Dict[str, float] = {
     "Pseudostructure": 1.03
 }
 
-def _phenix_output_path(pdb_path: Path) -> Path:
-    return pdb_path.with_suffix(".phenix")
+def _phenix_output_path(pdb_path: Path, output_path: Optional[Path] = None) -> Path:
+    return output_path if output_path is not None else pdb_path.with_suffix(".phenix")
 
 
 def _run_phenix(pdb_path: Path, output_path: Path) -> bool:
@@ -36,24 +39,33 @@ def _run_phenix(pdb_path: Path, output_path: Path) -> bool:
     to output_path. Returns True on success.
     """
     if output_path.exists() and output_path.stat().st_size > 0:
-        print("Cached output preview:")
-        for line in output_path.read_text(errors="replace").splitlines()[:40]:
-            print(line)
         return True
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["phenix.barbed_wire_analysis", str(pdb_path), "output.type=text"],
-        capture_output=True,
-        text=True,
-    )
-    
-    if result.returncode != 0:
-        print("STDERROR:")
-        print(result.stderr)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"{pdb_path.stem}_phenix_") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            # Give Phenix a local copy to work with inside the isolated cwd.
+            local_pdb = tmpdir_path / pdb_path.name
+            shutil.copy2(pdb_path, local_pdb)
+
+            result = subprocess.run(
+                ["phenix.barbed_wire_analysis", str(local_pdb), "output.type=text"],
+                cwd=tmpdir_path,
+                capture_output=True,
+                text=True,
+            )
+
+            if result.returncode != 0:
+                return False
+
+            output_path.write_text(result.stdout)
+            return True
+
+    except FileNotFoundError:
         return False
-    # debug
-    output_path.write_text(result.stdout)
-    return True
 
 
 def _parse_phenix_output(output_path: Path) -> Dict[str, float]:
@@ -101,33 +113,43 @@ def _parse_phenix_output(output_path: Path) -> Dict[str, float]:
     return {mode: count / total for mode, count in counts.items()}
 
 
-def get_mode_fractions(pdb_path: Path) -> Optional[Dict[str, float]]:
+def get_mode_fractions(
+    pdb_path: Path,
+    output_path: Optional[Path] = None,
+) -> Optional[Dict[str, float]]:
     """
-    Returns per-mode residue fractions for a PDB file, running phenix if needed
-    and caching the result alongside the PDB file.
-    Returns None if phenix is unavailable or fails.
-    """
-    output_path = _phenix_output_path(pdb_path)
-    try:
-        if not _run_phenix(pdb_path, output_path):
-            return None
-        # debug
-        # fractions = _parse_phenix_output(output_path)
+    Returns per-mode residue fractions for a PDB file, running Phenix if needed.
 
-        # for mode, fraction in fractions.items():
-        #     print(mode, fraction)
-        # debug
-        return _parse_phenix_output(output_path)
+    pdb_path:
+      Source PDB to analyze.
+
+    output_path:
+      Optional cache path. Pass model.dssp_path.with_suffix(".phenix") to force
+      the cache into the work directory.
+    """
+    phenix_path = _phenix_output_path(pdb_path, output_path)
+
+    try:
+        if not _run_phenix(pdb_path, phenix_path):
+            return None
+        return _parse_phenix_output(phenix_path)
     except FileNotFoundError:
         return None
 
-def phenix_fields_for_model(prefix: str, pdb_path: Path) -> Dict[str, object]:
-    fractions = get_mode_fractions(pdb_path)
+
+def phenix_fields_for_model(
+    prefix: str,
+    pdb_path: Path,
+    output_path: Optional[Path] = None,
+) -> Dict[str, object]:
+    fractions = get_mode_fractions(pdb_path, output_path)
     fields: Dict[str, object] = {}
+
     for mode in ALL_MODES:
         fields[f"{prefix}_phenix_{mode}"] = (
             f"{fractions.get(mode, 0.0):.3f}" if fractions is not None else ""
         )
+
     return fields
 
 

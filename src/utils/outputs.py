@@ -10,15 +10,17 @@ from utils.config import (
     SUMMARY_BASE_SUFFIX_COLUMNS,
     KEEP_GOING_COLUMNS,
     RECOVERY_METRIC_COLUMNS,
+    PHENIX_MODE_COLUMNS,
+    UNASSIGNED_METRIC_COLUMNS,
+    CHAINSAW_COLUMNS,
 )
 from utils.classes import ComparedSegment, ModelComparison, Residue, segment_annotation
 from utils.dssp import (
     get_sequence,
     get_dssp,
-    # model_disorder_metric_text,
-    # disorder_summary_fields,
+    unassigned_metrics_for_residues
 )
-from utils.structure import (
+from utils.pdb_helpers import (
     pymol_session,
     pymol_residue_selection,
     recovery_region_text,
@@ -32,14 +34,28 @@ from utils.utils import (
     wrap_fasta,
 )
 
-from utils.phenix_filter import get_mode_fractions, phenix_fields_for_model, ALL_MODES
+from utils.phenix_filter import phenix_fields_for_model, ALL_MODES
 
 
 # ---------------------------------------------------------------------------
 # Colored output PSE for the selected pair
 # ---------------------------------------------------------------------------
 
+def log_input_too_disordered(job_name: str, summary_dir: Path, percent: float) -> None:
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    log_path = summary_dir / "too_disordered.txt"
+    log_path.touch(exist_ok=True)
+    print(f"{job_name} was too disordered, not analyzed\t{percent:.2f}\n")
+    with log_path.open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fh.write(f"{job_name}\t{percent:.2f}\n")
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def create_selected_colored_pse(
+    cmd,
     dominant_model,
     alternative_model,
     dominant_residues: Sequence[Residue],
@@ -48,54 +64,53 @@ def create_selected_colored_pse(
     output_pse: Path,
 ) -> None:
     output_pse.parent.mkdir(parents=True, exist_ok=True)
-    with pymol_session() as cmd:
-        cmd.reinitialize()
-        cmd.load(str(dominant_model.pdb_path), "dominant")
-        cmd.load(str(alternative_model.pdb_path), "alternative")
-        try:
-            cmd.cealign("dominant and name CA", "alternative and name CA", quiet=1)
-        except Exception:
-            cmd.cealign("dominant", "alternative", quiet=1)
-        cmd.bg_color("white")
-        cmd.hide("everything")
-        cmd.show("cartoon", "dominant or alternative")
-        cmd.color("gray70", "dominant or alternative")
+    cmd.reinitialize()
+    cmd.load(str(dominant_model.pdb_path), "dominant")
+    cmd.load(str(alternative_model.pdb_path), "alternative")
+    try:
+        cmd.cealign("dominant and name CA", "alternative and name CA", quiet=1)
+    except Exception:
+        cmd.cealign("dominant", "alternative", quiet=1)
+    cmd.bg_color("white")
+    cmd.hide("everything")
+    cmd.show("cartoon", "dominant or alternative")
+    cmd.color("gray70", "dominant or alternative")
 
-        switch_positions = []
-        for segment in selected_comparison.switch_regions:
-            switch_positions.extend(range(segment.start, segment.end + 1))
+    switch_positions = []
+    for segment in selected_comparison.switch_regions:
+        switch_positions.extend(range(segment.start, segment.end + 1))
 
-        disordered_positions = []
-        for segment in selected_comparison.disordered_regions:
-            disordered_positions.extend(range(segment.start, segment.end + 1))
+    disordered_positions = []
+    for segment in selected_comparison.disordered_regions:
+        disordered_positions.extend(range(segment.start, segment.end + 1))
 
-        disordered_selection_dominant = pymol_residue_selection(
-            "dominant", dominant_residues, disordered_positions
+    disordered_selection_dominant = pymol_residue_selection(
+        "dominant", dominant_residues, disordered_positions
+    )
+    disordered_selection_alternative = pymol_residue_selection(
+        "alternative", alternative_residues, disordered_positions
+    )
+    switch_selection_dominant = pymol_residue_selection(
+        "dominant", dominant_residues, switch_positions
+    )
+    switch_selection_alternative = pymol_residue_selection(
+        "alternative", alternative_residues, switch_positions
+    )
+
+    if disordered_positions:
+        cmd.color(
+            "orange",
+            f"({disordered_selection_dominant}) or ({disordered_selection_alternative})",
         )
-        disordered_selection_alternative = pymol_residue_selection(
-            "alternative", alternative_residues, disordered_positions
-        )
-        switch_selection_dominant = pymol_residue_selection(
-            "dominant", dominant_residues, switch_positions
-        )
-        switch_selection_alternative = pymol_residue_selection(
-            "alternative", alternative_residues, switch_positions
+    if switch_positions:
+        cmd.color(
+            "red",
+            f"({switch_selection_dominant}) or ({switch_selection_alternative})",
         )
 
-        if disordered_positions:
-            cmd.color(
-                "orange",
-                f"({disordered_selection_dominant}) or ({disordered_selection_alternative})",
-            )
-        if switch_positions:
-            cmd.color(
-                "red",
-                f"({switch_selection_dominant}) or ({switch_selection_alternative})",
-            )
-
-        cmd.set("ray_opaque_background", 0)
-        cmd.orient("dominant or alternative")
-        cmd.save(str(output_pse))
+    cmd.set("ray_opaque_background", 0)
+    cmd.orient("dominant or alternative")
+    cmd.save(str(output_pse))
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +179,8 @@ def compact_comparison_annotation(
     base_dir: Path,
 ) -> str:
     if comparison is None:
-        return f"model={short_model_name(model_name, base_dir)} role=dominant"
+        return f"model={model_name} role=dominant"
+
     annotations = ",".join(comparison.annotations) if comparison.annotations else "-"
     rmsd = (
         f"{comparison.rmsd_to_dominant:.3f}"
@@ -172,8 +188,9 @@ def compact_comparison_annotation(
         else "NA"
     )
     reason = comparison.invalid_reason or "-"
+
     return (
-        f"model={short_model_name(model_name, base_dir)} "
+        f"model={model_name} "
         f"class={comparison.classification} "
         f"rmsd={rmsd} "
         f"sw={sum(segment.end - segment.start + 1 for segment in comparison.switch_regions)}/{len(comparison.switch_regions)} "
@@ -184,6 +201,7 @@ def compact_comparison_annotation(
 
 
 def write_final_comparison_file(
+    cmd,
     output_path: Path,
     job_name: str,
     run_mode: str,
@@ -210,10 +228,8 @@ def write_final_comparison_file(
         handle.write(f"# job={job_name}\n")
         handle.write(f"# mode={run_mode}\n")
         handle.write(f"# input={relative_path_for_summary(input_pse, base_dir)}\n")
-        handle.write(f"# dominant={short_model_name(dominant_model_name, base_dir)}\n")
-        handle.write(
-            f"# selected={short_model_name(selected_comparison.alternative_model, base_dir)}\n"
-        )
+        handle.write(f"# dominant={dominant_model_name}\n")
+        handle.write(f"# selected={selected_comparison.alternative_model}\n")
         handle.write(f"# selected_class={selected_comparison.classification}\n")
         handle.write(
             f"# rmsd_threshold={rmsd_threshold:.3f} min_run_length={min_run_length}\n"
@@ -226,6 +242,7 @@ def write_final_comparison_file(
             return
 
         recovery_by_model = calculate_recovery_regions_by_model(
+            cmd,
             models_by_name[dominant_model_name],
             models_by_name,
             assignments,
@@ -304,6 +321,9 @@ def summary_fieldnames_for_rows(rows: Sequence[Dict[str, object]]) -> List[str]:
     reserved.update(SUMMARY_BASE_SUFFIX_COLUMNS)
     reserved.update(KEEP_GOING_COLUMNS)
     reserved.update(RECOVERY_METRIC_COLUMNS)
+    reserved.update(PHENIX_MODE_COLUMNS)
+    reserved.update(UNASSIGNED_METRIC_COLUMNS)
+    reserved.update(CHAINSAW_COLUMNS)
     for row in rows:
         for key in row.keys():
             if key.startswith("change_"):
@@ -314,15 +334,17 @@ def summary_fieldnames_for_rows(rows: Sequence[Dict[str, object]]) -> List[str]:
             elif key not in reserved:
                 extras.add(key)
     fieldnames = list(SUMMARY_BASE_PREFIX_COLUMNS)
+    fieldnames.extend(CHAINSAW_COLUMNS)
     fieldnames.extend(f"change_{idx}" for idx in range(1, max_change_idx + 1))
     if any(any(column in row for column in KEEP_GOING_COLUMNS) for row in rows):
         fieldnames.extend(KEEP_GOING_COLUMNS)
     fieldnames.extend(RECOVERY_METRIC_COLUMNS)
+    fieldnames.extend(PHENIX_MODE_COLUMNS)
+    fieldnames.extend(UNASSIGNED_METRIC_COLUMNS)
     fieldnames.extend(SUMMARY_BASE_SUFFIX_COLUMNS)
     fieldnames.extend(sorted(extras.difference(fieldnames)))
     return fieldnames
-
-
+    
 def append_or_update_summary(
     summary_dir: Path,
     selected_comparison: ModelComparison,
@@ -351,16 +373,13 @@ def append_or_update_summary(
     }
     row = {
         "input_pse": relative_path_for_summary(input_pse, summary_base_dir),
-        "alternative_model": short_model_name(
-            output_comparison.alternative_model, summary_base_dir
-        ),
+        "alt_model": output_comparison.alternative_model,
         "classification": classification,
         "rmsd_to_dominant": (
             f"{output_comparison.rmsd_to_dominant:.3f}"
             if output_comparison.rmsd_to_dominant is not None
             else "N/A"
         ),
-        "rmsd_threshold": f"{rmsd_threshold:.3f}",
         "n_switch_residues": sum(
             segment.end - segment.start + 1
             for segment in output_comparison.switch_regions
@@ -430,6 +449,7 @@ def assemble_outputs(
     comparisons_by_model: Dict[str, ModelComparison],
     selected_comparison: ModelComparison,
     extra_summary_fields: Dict[str, object],
+    cmd,
     best_failed_comparison: Optional[ModelComparison] = None,
 ) -> None:
     # For output purposes, use the best failed comparison when no hit was found
@@ -455,12 +475,27 @@ def assemble_outputs(
     have_both_residue_sets = (
         dominant_residues is not None and alternative_residues is not None
     )
+    dominant_residues = all_assignments.get(dominant_model.model_name)
+    if dominant_residues is not None:
+        extra_summary_fields.update(unassigned_metrics_for_residues("dom_poor_structure", dominant_residues))
+    if alternative_residues is not None:
+        extra_summary_fields.update(unassigned_metrics_for_residues("alt_poor_structure", alternative_residues))
+    extra_summary_fields.update(
+        phenix_fields_for_model(
+            "dom",
+            dominant_model.pdb_path,
+            dominant_model.dssp_path.with_suffix(".phenix"),
+        )
+    )
 
-    extra_summary_fields.update(phenix_fields_for_model("dominant", dominant_model.pdb_path))
     if alternative_model is not None:
-        alt_fractions = get_mode_fractions(alternative_model.pdb_path)
-        extra_summary_fields.update(phenix_fields_for_model("alternative", alternative_model.pdb_path))
-
+        extra_summary_fields.update(
+            phenix_fields_for_model(
+                "alt",
+                alternative_model.pdb_path,
+                alternative_model.dssp_path.with_suffix(".phenix"),
+            )
+        )
     if output_comparison.same_ss_preserved_percent is not None:
         extra_summary_fields["same_ss_preserved"] = f"{output_comparison.same_ss_preserved_percent:.2f}"
 
@@ -468,6 +503,7 @@ def assemble_outputs(
     if alternative_model is not None and have_both_residue_sets:
         extra_summary_fields.update(
             recovery_summary_fields_for_selected(
+                cmd,
                 output_comparison,
                 dominant_model,
                 alternative_model,
@@ -482,6 +518,7 @@ def assemble_outputs(
         alternative_sequence = get_sequence(alternative_residues)
         selected_colored_pse = selected_pse_path
         create_selected_colored_pse(
+            cmd,
             dominant_model=dominant_model,
             alternative_model=alternative_model,
             dominant_residues=dominant_residues,
@@ -504,6 +541,7 @@ def assemble_outputs(
 
     if args.keep_work:
         write_final_comparison_file(
+            cmd,
             output_path=final_comparison_path,
             job_name=job_name,
             run_mode=run_mode,
@@ -513,7 +551,7 @@ def assemble_outputs(
             assignment_order=assignment_order,
             comparisons_by_model=comparisons_by_model,
             models_by_name=models_by_name,
-            selected_comparison=selected_comparison,
+            selected_comparison=output_comparison,
             rmsd_threshold=args.rmsd_threshold,
             min_run_length=args.min_run_length,
             base_dir=args.pse_file.resolve().parent,
@@ -575,13 +613,14 @@ def _print_verbose_summary(
 
     print("Dominant phenix modes:")
     for mode in ALL_MODES:
-        key = f"dominant_phenix_{mode}"
+        key = f"dom_phenix_{mode}"
         print(f"  {mode}: {extra_summary_fields.get(key, 'unavailable')}")
 
     print("Alternative phenix modes:")
     for mode in ALL_MODES:
-        key = f"alternative_phenix_{mode}"
+        key = f"alt_phenix_{mode}"
         print(f"  {mode}: {extra_summary_fields.get(key, 'unavailable')}")
+    print(f"Bad structures skipped: {extra_summary_fields.get('n_skipped', 0)}")
 
     if selected_comparison.invalid_reason:
         print(f"Invalid reason: {selected_comparison.invalid_reason}")

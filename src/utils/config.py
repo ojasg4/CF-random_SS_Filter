@@ -36,3 +36,9 @@ SUMMARY_BASE_PREFIX_COLUMNS = CFG["csv_columns"]["base_prefix"]
 SUMMARY_BASE_SUFFIX_COLUMNS = CFG["csv_columns"]["base_suffix"]
 KEEP_GOING_COLUMNS          = CFG["csv_columns"]["keep_going"]
 RECOVERY_METRIC_COLUMNS     = CFG["csv_columns"]["recovery_metrics"]
+UNASSIGNED_MAX_ALTERNATIVE_PERCENT = CFG["unassigned_filter"]["max_alternative_percent"]
+
+PHENIX_MODE_COLUMNS   = CFG["csv_columns"]["phenix_mode_columns"]
+UNASSIGNED_METRIC_COLUMNS = CFG["csv_columns"]["unassigned_metrics"]
+
+CHAINSAW_COLUMNS = CFG["csv_columns"].get("chainsaw_columns", [])

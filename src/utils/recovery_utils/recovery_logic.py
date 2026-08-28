@@ -12,10 +12,11 @@ HELIX_DSSP_CODES      = set(CFG["dssp_codes"]["helix"])
 BETA_DSSP_CODES       = set(CFG["dssp_codes"]["beta"])
 DISORDERED_DSSP_CODES = set(CFG["dssp_codes"]["disordered"])
 
-MIN_BETA_BRIDGE_RESHUFFLED_RESIDUES = 2
+MIN_CONSECUTIVE = 3
+MIN_BETA_BRIDGE_RESHUFFLED_RESIDUES = 15
 BETA_BRIDGE_PARTNER_SHIFT_TOLERANCE = 5
 RIGID_BODY_WINDOW_SIZE              = 10
-RIGID_BODY_CA_DISTANCE_THRESHOLD    = 3000 #in Angstroms, Basically turning it off for debugging
+RIGID_BODY_CA_DISTANCE_THRESHOLD    = 10000 #in Angstroms, Basically turning it off for debugging
 
 DETECTOR_BRIDGE_RESHUFFLE = "beta_bridge_reshuffle"
 DETECTOR_DISORDER_BETA    = "disorder_to_beta"
@@ -94,6 +95,8 @@ def detect_bridge_reshuffle(
         else:
             merged.append(region)
     return merged
+
+
 def _detect_disorder_transition(
     dominant: Sequence[ResidueSS],
     alternative: Sequence[ResidueSS],
@@ -171,6 +174,12 @@ def _detect_disorder_transition(
             )
         else:
             merged.append(region)
+    # Manually uncomment as part of the strict flag
+    # #Heuristic from E Coli meant to reduce false positives
+    # #IS MORE STRICT
+    # longest_run = max((r.end - r.start + 1 for r in merged), default=0)
+    # if longest_run < MIN_CONSECUTIVE:
+    #     return []    
     return merged
 
 

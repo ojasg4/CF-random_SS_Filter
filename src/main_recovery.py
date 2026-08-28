@@ -40,14 +40,18 @@ def parse_args() -> argparse.Namespace:
         "--dominant-label-patterns", nargs="+", default=DOMINANT_LABEL_PATTERNS
     )
     parser.add_argument(
-        "--bridge-reshuffling", action="store_true",
+        "--beta-bridges", action="store_true",
         help="Enable beta bridge reshuffling detection.",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="Enables stricter parameters for recovery centered around rejecting similar secondary structures. Might exclude rigid body translations."
     )
     parser.add_argument(
         "--min-run-length", type=int, default=MIN_CONSECUTIVE_CHANGED_RESIDUES
     )
-    parser.add_argument("--keep-work", action="store_true")
     parser.add_argument("--verbose",   action="store_true")
+    parser.add_argument("--chainsaw", action="store_true")
     return parser.parse_args()
 
 
@@ -72,24 +76,18 @@ def main() -> int:
                 print(f"[{idx}/{len(rows)}] {row.get('input_pse', '')}")
 
             input_pse = summary_base_dir / row.get("input_pse", "")
-            job_name = Path(row.get("raw_dssp_dir", "")).parts[-2] if row.get("raw_dssp_dir") else input_pse.stem
+            raw = row.get("raw_dssp_dir", "").strip()
+            work_dir = summary_base_dir / raw if raw else args.work_root / input_pse.stem
+            job_name = work_dir.name
             raw_dssp_dir = args.logs_root / job_name / "raw_dssp_runs"
 
-            if args.keep_work:
-                work_dir = args.work_root / job_name
-                work_dir.mkdir(parents=True, exist_ok=True)
-                out_row, recovered = run_recovery_pipeline(
-                    args, job_name, input_pse,
-                    work_dir, raw_dssp_dir, summary_base_dir,
-                )
-            else:
-                with tempfile.TemporaryDirectory(
-                    prefix=f"{job_name}_recovery_"
-                ) as tmp:
-                    out_row, recovered = run_recovery_pipeline(
-                        args, job_name, input_pse,
-                        Path(tmp), raw_dssp_dir, summary_base_dir,
-                    )
+            work_dir = args.work_root / job_name
+            work_dir.mkdir(parents=True, exist_ok=True)
+            out_row, recovered = run_recovery_pipeline(
+                args, job_name, input_pse,
+                work_dir, raw_dssp_dir, summary_base_dir,
+            )
+
 
             if recovered:
                 recovered_rows.append(out_row)

@@ -16,7 +16,7 @@ from utils.dssp import (
     parse_dssp,
     run_dssp,
 )
-from utils.structure import (
+from utils.pdb_helpers import (
     extract_models_from_pse,
     find_dominant_model,
     find_keep_going_pdb_files,
